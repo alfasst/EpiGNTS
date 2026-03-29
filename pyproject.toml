@@ -1,0 +1,24 @@
+[project]
+name = "gnts-epidemic-sim"
+version = "0.1.0"
+description = "Graph-based Network Testing Strategies for epidemic simulation"
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.9",
+    "pandas>=1.5",
+    "networkx>=3.0",
+    "matplotlib>=3.7",
+    "tqdm>=4.65",
+
+    # Core ML
+    "torch==2.0.1",
+
+    # PyTorch Geometric (API only; extensions resolved via uv.lock)
+    "torch-geometric==2.4.0",
+]
+
+[tool.uv]
+# uv will respect uv.lock exactly
+managed = true

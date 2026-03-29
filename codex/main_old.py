@@ -156,8 +156,6 @@ def main():
             kits_schedule = [(d, 2 * k) for d, k in config.KITS_SCHEDULE]
         else:
             kits_schedule = config.KITS_SCHEDULE
-            
-        sim_structures = build_sim_structures(G)
 
         for strategy in STRATEGIES:
             print(f"  Strategy: {strategy}")
@@ -187,13 +185,11 @@ def main():
                     trained_agents = []
 
                     for _ in tqdm(range(config.N_TRAINING_RUNS)):
-                    
                         _, agent, _, _ = run_simulation(
-                            strategy, G,
-                            sim_structures=sim_structures,
+                            strategy,
+                            G,
                             kits_schedule=kits_schedule,
-                            )
-                       
+                        )
                         if agent is not None:
                             trained_agents.append(agent)
 
@@ -215,10 +211,11 @@ def main():
 
             for run in range(config.N_TESTING_RUNS):
                 daily_records, _, metrics, _ = run_simulation(
-                            strategy, G,
-                            sim_structures=sim_structures,
-                            kits_schedule=kits_schedule,
-                            )
+                    strategy,
+                    G,
+                    pretrained_gnts=pretrained,
+                    kits_schedule=kits_schedule,
+                )
 
                 for rec in daily_records:
                     day = rec['Day']

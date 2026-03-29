@@ -1,0 +1,71 @@
+version = 1
+
+[[package]]
+name = "torch"
+version = "2.0.1"
+source = "registry"
+dependencies = []
+
+[[package]]
+name = "torch-geometric"
+version = "2.4.0"
+source = "registry"
+dependencies = [
+    "torch",
+    "numpy",
+    "scipy",
+]
+
+[[package]]
+name = "torch-scatter"
+version = "2.1.2"
+source = "registry"
+dependencies = ["torch"]
+
+[[package]]
+name = "torch-sparse"
+version = "0.6.18"
+source = "registry"
+dependencies = ["torch"]
+
+[[package]]
+name = "torch-cluster"
+version = "1.6.3"
+source = "registry"
+dependencies = ["torch"]
+
+[[package]]
+name = "torch-spline-conv"
+version = "1.2.2"
+source = "registry"
+dependencies = ["torch"]
+
+[[package]]
+name = "numpy"
+version = "1.26.4"
+source = "registry"
+
+[[package]]
+name = "scipy"
+version = "1.11.4"
+source = "registry"
+
+[[package]]
+name = "pandas"
+version = "2.1.4"
+source = "registry"
+
+[[package]]
+name = "networkx"
+version = "3.2.1"
+source = "registry"
+
+[[package]]
+name = "matplotlib"
+version = "3.8.2"
+source = "registry"
+
+[[package]]
+name = "tqdm"
+version = "4.66.1"
+source = "registry"
