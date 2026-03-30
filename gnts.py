@@ -9,32 +9,24 @@
 # Wrappers, heuristics, and non-GNTS strategies must live in strategies.py
 #
 # Design principles:
-# - No network generation
-# - No experiment orchestration
+# - No network generation / no experiment orchestration
 # - No reliance on mutable global block counts
-# - Block structure inferred from the graph
+# - Block structure inferred from the graph at construction time only
 #
 # Changes vs previous version:
-# - LocalGNTS.update() and GlobalGNTS.update() train against an informed
-#   prior accumulated from the full test buffer (history) rather than 1.0
+# - LocalGNTS.update() / GlobalGNTS.update() use history-informed priors
+# - GPU-aware: all tensors placed on DEVICE; .cpu() only for numpy ops
+# - DEVICE falls back to CPU if GPU compute capability < sm_70
 #
-# GPU changes for Kaggle:
-# - DEVICE = torch.device('cuda' if available, else 'cpu') resolved once
-#   at module load time and shared by all agents
-# - All nn.Module instances moved to DEVICE at init via .to(DEVICE)
-# - Every tensor created inside _get_context(), update(), and
-#   get_allocation_proportions() is explicitly placed on DEVICE
-# - build_edge_index() accepts an optional device argument
-# - All .detach().cpu().numpy() calls are preserved so numpy/scipy
-#   operations (Beta sampling, prior accumulation) stay on CPU
-# - save_model() moves modules to CPU before serialising so checkpoints
-#   are portable regardless of where they were created, then restores
-#   them to DEVICE
-# - load_model() maps directly to DEVICE so the loaded model is
-#   immediately ready for inference on the current hardware
+# GlobalGNTS optimisations (this version):
+# 1. _update_mappings() eliminated — node_map and block_id cached once
+#    at __init__ time; topology never changes during a simulation.
+# 2. edge_index precomputed once in build_sim_structures() and passed
+#    in at construction — no per-step edge list rebuild.
+# 3. Python pooling loop replaced by torch_scatter.scatter_mean —
+#    a single fused GPU op that averages node embeddings per block.
 
 import os
-from collections import defaultdict
 from itertools import chain
 
 import numpy as np
@@ -44,14 +36,27 @@ import torch.nn.functional as F
 import networkx as nx
 from torch_geometric.nn import SAGEConv
 from torch_geometric.data import Data
+from torch_scatter import scatter_mean
 
 import config
 
 # --------------------------------------------------
-# Device resolution (done once at import time)
+# Device resolution  (with sm_60 / P100 fallback)
 # --------------------------------------------------
 
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def _resolve_device() -> torch.device:
+    if not torch.cuda.is_available():
+        return torch.device('cpu')
+    major, minor = torch.cuda.get_device_capability(0)
+    if major < 7:
+        print(
+            f"[gnts] WARNING: GPU sm_{major}{minor} < sm_70 minimum. "
+            f"Falling back to CPU."
+        )
+        return torch.device('cpu')
+    return torch.device('cuda')
+
+DEVICE = _resolve_device()
 print(f"[gnts] Running on device: {DEVICE}")
 
 
@@ -65,15 +70,15 @@ class GraphSAGE(nn.Module):
         self.conv1 = SAGEConv(input_dim, hidden_dim)
         self.conv2 = SAGEConv(hidden_dim, output_dim)
 
-    def forward(self, data: Data):
+    def forward(self, data: Data) -> torch.Tensor:
         x, edge_index = data.x, data.edge_index
         if edge_index.numel() == 0:
-            # Return a zero embedding on the correct device
-            return torch.zeros((x.size(0), config.GNN_OUTPUT_DIM), device=x.device)
+            return torch.zeros(
+                (x.size(0), config.GNN_OUTPUT_DIM), device=x.device
+            )
         x = F.relu(self.conv1(x, edge_index))
         x = F.dropout(x, p=0.5, training=self.training)
-        x = self.conv2(x, edge_index)
-        return x
+        return self.conv2(x, edge_index)
 
 
 class PriorBooster(nn.Module):
@@ -82,9 +87,8 @@ class PriorBooster(nn.Module):
         self.fc1 = nn.Linear(input_dim, 16)
         self.fc2 = nn.Linear(16, 2)
 
-    def forward(self, x: torch.Tensor):
-        x = F.relu(self.fc1(x))
-        return F.softplus(self.fc2(x))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.softplus(self.fc2(F.relu(self.fc1(x))))
 
 
 # --------------------------------------------------
@@ -96,7 +100,11 @@ def build_edge_index(
     node_map: dict,
     device: torch.device = DEVICE,
 ) -> torch.Tensor:
-    """Build a COO edge index tensor placed on `device`."""
+    """Build a COO edge index tensor for a (sub)graph on `device`.
+
+    Used by LocalGNTS for per-block subgraphs.
+    GlobalGNTS uses the precomputed edge_index from build_sim_structures.
+    """
     edges = [
         (node_map[u], node_map[v])
         for u, v in G.edges()
@@ -108,14 +116,10 @@ def build_edge_index(
 
 
 def _accumulate_priors(history, num_blocks: int):
-    """Accumulate base alpha/beta priors from the full test buffer.
+    """Accumulate empirical base alpha/beta from the test buffer.
 
-    Returns two float32 numpy arrays of shape (num_blocks,) initialised
-    at 1.0 (uniform Beta prior) and incremented by positive/negative
-    counts from every day in history.
-
-    Kept on CPU / numpy intentionally — these values feed np.random.beta
-    and torch.tensor() wrappers, both of which expect CPU scalars.
+    Returns CPU float32 numpy arrays — these feed np.random.beta and
+    torch.tensor() calls that require CPU scalars.
     """
     base_alphas = np.ones(num_blocks, dtype=np.float32)
     base_betas  = np.ones(num_blocks, dtype=np.float32)
@@ -145,7 +149,6 @@ class LocalGNTS:
         self.num_blocks = num_blocks
         self.device     = device
 
-        # Build ModuleLists and move to device immediately
         self.local_gnns = nn.ModuleList([
             GraphSAGE(4, 16, gnn_out_dim) for _ in range(num_blocks)
         ]).to(device)
@@ -154,14 +157,19 @@ class LocalGNTS:
             PriorBooster(context_dim) for _ in range(num_blocks)
         ]).to(device)
 
-        params = chain(self.local_gnns.parameters(), self.prior_boosters.parameters())
-        self.optimizer = torch.optim.Adam(params, lr=0.005, weight_decay=weight_decay)
+        params = chain(
+            self.local_gnns.parameters(),
+            self.prior_boosters.parameters(),
+        )
+        self.optimizer = torch.optim.Adam(
+            params, lr=0.005, weight_decay=weight_decay
+        )
 
     # ----------------------
     # Context construction
     # ----------------------
     def _get_context(self, G: nx.Graph, day: int, sim_days: int) -> torch.Tensor:
-        """Build a (num_blocks, context_dim) tensor on self.device."""
+        """(num_blocks, context_dim) tensor on self.device."""
         contexts = []
         for bid in range(self.num_blocks):
             nodes = [n for n, d in G.nodes(data=True) if d.get('block_id') == bid]
@@ -174,7 +182,6 @@ class LocalGNTS:
             sub      = G.subgraph(nodes)
             node_map = {n: i for i, n in enumerate(sub.nodes())}
 
-            # Node feature matrix built directly on device
             x = torch.zeros((len(nodes), 4), device=self.device)
             for i, n in enumerate(sub.nodes()):
                 s   = G.nodes[n].get('state', 'S')
@@ -182,19 +189,16 @@ class LocalGNTS:
                 x[i, idx] = 1.0
 
             edge_index = build_edge_index(sub, node_map, device=self.device)
-            data       = Data(x=x, edge_index=edge_index)
-
-            emb       = self.local_gnns[bid](data)
-            block_emb = (
-                emb.mean(dim=0)
-                if emb.numel() > 0
+            emb        = self.local_gnns[bid](Data(x=x, edge_index=edge_index))
+            block_emb  = (
+                emb.mean(dim=0) if emb.numel() > 0
                 else torch.zeros(config.GNN_OUTPUT_DIM, device=self.device)
             )
 
             t = torch.tensor([day / sim_days], dtype=torch.float, device=self.device)
             contexts.append(torch.cat([block_emb, t]))
 
-        return torch.stack(contexts)  # (num_blocks, context_dim) on self.device
+        return torch.stack(contexts)
 
     # ----------------------
     # Allocation
@@ -207,7 +211,6 @@ class LocalGNTS:
 
         alphas, betas = _accumulate_priors(history, self.num_blocks)
 
-        # Boosts computed on device, pulled to CPU for numpy Beta sampling
         boosts = torch.stack([
             self.prior_boosters[i](context[i]) for i in range(self.num_blocks)
         ])
@@ -216,8 +219,7 @@ class LocalGNTS:
 
         rates = np.random.beta(alphas, betas)
         return (
-            rates / rates.sum()
-            if rates.sum() > 0
+            rates / rates.sum() if rates.sum() > 0
             else np.ones(self.num_blocks) / self.num_blocks
         )
 
@@ -225,73 +227,52 @@ class LocalGNTS:
     # Learning
     # ----------------------
     def update(self, G, day: int, sim_days: int, daily_results, history=None):
-        """Update GNNs and PriorBoosters via Beta-Binomial NLL.
-
-        base_alphas/base_betas are accumulated from the full test buffer
-        (history) before the GNN boost is added, so the gradient signal
-        reflects the empirical posterior built up over all previous days.
-        """
         self.local_gnns.train()
         self.prior_boosters.train()
         self.optimizer.zero_grad()
 
-        context = self._get_context(G, day, sim_days)
+        context                  = self._get_context(G, day, sim_days)
+        base_alphas, base_betas  = _accumulate_priors(history, self.num_blocks)
 
-        base_alphas, base_betas = _accumulate_priors(history, self.num_blocks)
-
-        # Loss scalar lives on device so .backward() propagates correctly
         loss  = torch.tensor(0.0, device=self.device)
         valid = 0
 
         for i in range(self.num_blocks):
             if i >= len(daily_results) or torch.all(context[i] == 0):
                 continue
-
             boosts = self.prior_boosters[i](context[i])
-
-            # Wrap CPU numpy scalars as device tensors before arithmetic
-            alpha = (
-                torch.tensor(base_alphas[i], dtype=torch.float, device=self.device)
-                + boosts[0]
-            )
-            beta = (
-                torch.tensor(base_betas[i], dtype=torch.float, device=self.device)
-                + boosts[1]
-            )
-
+            alpha  = torch.tensor(
+                base_alphas[i], dtype=torch.float, device=self.device
+            ) + boosts[0]
+            beta   = torch.tensor(
+                base_betas[i], dtype=torch.float, device=self.device
+            ) + boosts[1]
             s = float(daily_results[i]['positive'])
             f = float(daily_results[i]['negative'])
-
             nll = -(
                 torch.lgamma(alpha + s) + torch.lgamma(beta + f)
                 - torch.lgamma(alpha + beta + s + f)
-                - (torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta))
+                - (torch.lgamma(alpha) + torch.lgamma(beta)
+                   - torch.lgamma(alpha + beta))
             )
-
             if not torch.isnan(nll):
                 loss  += nll
                 valid += 1
 
         if valid > 0:
-            loss = loss / valid
-            loss.backward()
+            (loss / valid).backward()
             self.optimizer.step()
-            return loss.item()
+            return (loss / valid).item()
         return 0.0
 
     # ----------------------
     # Persistence
     # ----------------------
     def save_model(self, path: str):
-        # Move to CPU before serialising — checkpoints must be portable
-        torch.save(
-            {
-                'local_gnns':     self.local_gnns.cpu().state_dict(),
-                'prior_boosters': self.prior_boosters.cpu().state_dict(),
-            },
-            path,
-        )
-        # Restore to original device after saving
+        torch.save({
+            'local_gnns':     self.local_gnns.cpu().state_dict(),
+            'prior_boosters': self.prior_boosters.cpu().state_dict(),
+        }, path)
         self.local_gnns.to(self.device)
         self.prior_boosters.to(self.device)
 
@@ -310,6 +291,33 @@ class LocalGNTS:
 # --------------------------------------------------
 
 class GlobalGNTS:
+    """Graph-level GNTS agent with three performance optimisations:
+
+    1. node_map and block_id_tensor cached once at __init__ —
+       _update_mappings() is never called again.
+    2. edge_index_t (precomputed COO tensor from build_sim_structures)
+       passed in at construction — no per-step edge list rebuild.
+    3. scatter_mean (torch_scatter) replaces the Python pooling loop —
+       a single fused GPU op averages node embeddings per block.
+
+    Construction
+    ------------
+    Pass the five values returned by build_sim_structures() as
+    `precomputed`:
+
+        node_index, nodes, adj_csr, block_arr, edge_index_t, block_id_t
+            = build_sim_structures(G)
+
+        agent = GlobalGNTS(
+            G, num_blocks, gnn_out_dim, context_dim, weight_decay,
+            precomputed=(node_index, nodes, adj_csr, block_arr,
+                         edge_index_t, block_id_t),
+        )
+
+    If `precomputed` is None, the structures are built internally from G
+    (slower — use only for backward compatibility / tests).
+    """
+
     def __init__(
         self,
         G: nx.Graph,
@@ -318,59 +326,93 @@ class GlobalGNTS:
         context_dim: int,
         weight_decay: float,
         device: torch.device = DEVICE,
+        precomputed=None,
     ):
-        self.G          = G
         self.num_blocks = num_blocks
         self.device     = device
 
-        # Build modules and move to device immediately
         self.global_gnn    = GraphSAGE(4, 16, gnn_out_dim).to(device)
         self.prior_booster = PriorBooster(context_dim).to(device)
 
-        params = chain(self.global_gnn.parameters(), self.prior_booster.parameters())
-        self.optimizer = torch.optim.Adam(params, lr=0.005, weight_decay=weight_decay)
+        params = chain(
+            self.global_gnn.parameters(),
+            self.prior_booster.parameters(),
+        )
+        self.optimizer = torch.optim.Adam(
+            params, lr=0.005, weight_decay=weight_decay
+        )
 
-        self._update_mappings(G)
+        # --------------------------------------------------
+        # Cache static graph structures — built once, never rebuilt
+        # --------------------------------------------------
+        if precomputed is not None:
+            node_index, nodes, _adj_csr, _block_arr, edge_index_t, block_id_t = precomputed
+        else:
+            # Fallback: build internally (slower path)
+            from network_epidemic import build_sim_structures
+            node_index, nodes, _adj_csr, _block_arr, edge_index_t, block_id_t = \
+                build_sim_structures(G, device=device)
 
-    def _update_mappings(self, G: nx.Graph):
-        self.node_map      = {n: i for i, n in enumerate(G.nodes())}
-        self.node_to_block = nx.get_node_attributes(G, 'block_id')
+        # node_map: node_id -> contiguous index (CPU dict, used for feature matrix)
+        self.node_map    = node_index          # {node_id: int}
+        self.nodes       = nodes               # [node_id, ...]  index -> node_id
+        self.N           = len(nodes)
+
+        # Precomputed COO edge index on device — reused every _get_context call
+        self.edge_index_t = edge_index_t.to(device)   # (2, E) LongTensor
+
+        # Block id per node on device — fed directly to scatter_mean
+        # Mask out -1 entries (nodes with no block) to block 0 for scatter safety;
+        # those nodes are excluded from the block embedding by zeroing their weight.
+        raw_bid            = block_id_t.to(device)     # (N,) LongTensor
+        self.valid_mask    = raw_bid >= 0              # (N,) BoolTensor
+        # scatter_mean requires non-negative index; clamp -1 -> 0 (masked later)
+        self.block_id_t    = raw_bid.clamp(min=0)      # (N,) LongTensor
 
     # ----------------------
-    # Context construction
+    # Context construction  (optimised)
     # ----------------------
     def _get_context(self, G: nx.Graph, day: int, sim_days: int) -> torch.Tensor:
-        """Build a (num_blocks, context_dim) tensor on self.device."""
-        self._update_mappings(G)
-        N = G.number_of_nodes()
+        """(num_blocks, context_dim) tensor on self.device.
 
-        # Full-graph node feature matrix built directly on device
-        x = torch.zeros((N, 4), device=self.device)
-        for n, i in self.node_map.items():
-            s   = G.nodes[n].get('state', 'S')
-            idx = ['I', 'Q', 'R'].index(s) if s in ['I', 'Q', 'R'] else 3
-            x[i, idx] = 1.0
+        Optimisations vs old version
+        ----------------------------
+        - No _update_mappings() call — node_map is already cached.
+        - No edge_index rebuild — self.edge_index_t is precomputed.
+        - No Python pooling loop — scatter_mean does block aggregation.
+        """
+        # ---- Node feature matrix (still needs G.nodes state after sync) ----
+        x = torch.zeros((self.N, 4), device=self.device)
+        for n, idx in self.node_map.items():
+            s    = G.nodes[n].get('state', 'S')
+            feat = ['I', 'Q', 'R'].index(s) if s in ['I', 'Q', 'R'] else 3
+            x[idx, feat] = 1.0
 
-        edge_index = build_edge_index(G, self.node_map, device=self.device)
-        data       = Data(x=x, edge_index=edge_index)
-        node_emb   = self.global_gnn(data)  # (N, gnn_out_dim) on device
+        # ---- GNN forward — full graph, precomputed edge index ----
+        node_emb = self.global_gnn(
+            Data(x=x, edge_index=self.edge_index_t)
+        )  # (N, gnn_out_dim) on device
 
-        # Pool node embeddings into per-block embeddings (stays on device)
-        block_emb = torch.zeros(
-            (self.num_blocks, config.GNN_OUTPUT_DIM), device=self.device
+        # ---- Block pooling via scatter_mean (single GPU op) ----
+        # Zero out embeddings of nodes with no valid block before scattering
+        if not self.valid_mask.all():
+            node_emb = node_emb * self.valid_mask.unsqueeze(1).float()
+
+        # scatter_mean: for each block b, average node_emb[i] where block_id_t[i]==b
+        # out_size = num_blocks ensures every block gets a row even if empty
+        block_emb = scatter_mean(
+            node_emb,
+            self.block_id_t,
+            dim=0,
+            out=torch.zeros(
+                (self.num_blocks, config.GNN_OUTPUT_DIM), device=self.device
+            ),
+        )  # (num_blocks, gnn_out_dim) on device
+
+        t = torch.full(
+            (self.num_blocks, 1), day / sim_days, device=self.device
         )
-        counts = defaultdict(int)
-        for n, i in self.node_map.items():
-            bid = self.node_to_block.get(n)
-            if isinstance(bid, int) and 0 <= bid < self.num_blocks:
-                block_emb[bid] += node_emb[i]
-                counts[bid]    += 1
-
-        for bid, c in counts.items():
-            block_emb[bid] /= max(c, 1)
-
-        t = torch.full((self.num_blocks, 1), day / sim_days, device=self.device)
-        return torch.cat([block_emb, t], dim=1)  # (num_blocks, context_dim) on device
+        return torch.cat([block_emb, t], dim=1)  # (num_blocks, context_dim)
 
     # ----------------------
     # Allocation
@@ -383,15 +425,13 @@ class GlobalGNTS:
 
         alphas, betas = _accumulate_priors(history, self.num_blocks)
 
-        # Boosts on device, pulled to CPU for numpy Beta sampling
-        boosts = self.prior_booster(context)
+        boosts = self.prior_booster(context)   # (num_blocks, 2)
         alphas = np.maximum(alphas + boosts[:, 0].detach().cpu().numpy(), 1e-6)
         betas  = np.maximum(betas  + boosts[:, 1].detach().cpu().numpy(), 1e-6)
 
         rates = np.random.beta(alphas, betas)
         return (
-            rates / rates.sum()
-            if rates.sum() > 0
+            rates / rates.sum() if rates.sum() > 0
             else np.ones(self.num_blocks) / self.num_blocks
         )
 
@@ -399,73 +439,53 @@ class GlobalGNTS:
     # Learning
     # ----------------------
     def update(self, G, day: int, sim_days: int, daily_results, history=None):
-        """Update global GNN and PriorBooster via Beta-Binomial NLL.
-
-        Mirrors the LocalGNTS fix: base_alphas/base_betas are accumulated
-        from the full test buffer so the gradient is computed against the
-        empirical posterior rather than a flat prior.
-        """
+        """Update global GNN and PriorBooster via Beta-Binomial NLL."""
         self.global_gnn.train()
         self.prior_booster.train()
         self.optimizer.zero_grad()
 
-        context = self._get_context(G, day, sim_days)
+        context                  = self._get_context(G, day, sim_days)
+        base_alphas, base_betas  = _accumulate_priors(history, self.num_blocks)
 
-        base_alphas, base_betas = _accumulate_priors(history, self.num_blocks)
-
-        # Loss scalar lives on device so .backward() propagates correctly
         loss  = torch.tensor(0.0, device=self.device)
         valid = 0
 
         for i in range(self.num_blocks):
             if i >= len(daily_results) or torch.all(context[i] == 0):
                 continue
-
             boosts = self.prior_booster(context[i])
-
-            # Wrap CPU numpy scalars as device tensors before arithmetic
-            alpha = (
-                torch.tensor(base_alphas[i], dtype=torch.float, device=self.device)
-                + boosts[0]
-            )
-            beta = (
-                torch.tensor(base_betas[i], dtype=torch.float, device=self.device)
-                + boosts[1]
-            )
-
+            alpha  = torch.tensor(
+                base_alphas[i], dtype=torch.float, device=self.device
+            ) + boosts[0]
+            beta   = torch.tensor(
+                base_betas[i], dtype=torch.float, device=self.device
+            ) + boosts[1]
             s = float(daily_results[i]['positive'])
             f = float(daily_results[i]['negative'])
-
             nll = -(
                 torch.lgamma(alpha + s) + torch.lgamma(beta + f)
                 - torch.lgamma(alpha + beta + s + f)
-                - (torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta))
+                - (torch.lgamma(alpha) + torch.lgamma(beta)
+                   - torch.lgamma(alpha + beta))
             )
-
             if not torch.isnan(nll):
                 loss  += nll
                 valid += 1
 
         if valid > 0:
-            loss = loss / valid
-            loss.backward()
+            (loss / valid).backward()
             self.optimizer.step()
-            return loss.item()
+            return (loss / valid).item()
         return 0.0
 
     # ----------------------
     # Persistence
     # ----------------------
     def save_model(self, path: str):
-        # Move to CPU before serialising — checkpoints must be portable
-        torch.save(
-            {
-                'global_gnn':    self.global_gnn.cpu().state_dict(),
-                'prior_booster': self.prior_booster.cpu().state_dict(),
-            },
-            path,
-        )
-        # Restore to original device after saving
+        torch.save({
+            'global_gnn':    self.global_gnn.cpu().state_dict(),
+            'prior_booster': self.prior_booster.cpu().state_dict(),
+        }, path)
         self.global_gnn.to(self.device)
         self.prior_booster.to(self.device)
 

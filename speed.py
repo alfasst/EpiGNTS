@@ -8,8 +8,8 @@
 # measured is the speed and fidelity of run_seiqr_step itself.
 #
 # Outputs:
-#   results/compare_timing.csv        — per-network per-run wall times
-#   results/compare_curves_<NET>.png  — S/E/I/A/Q/R vs time, old vs new
+#   plots/compare_timing.csv        — per-network per-run wall times
+#   plots/compare_curves_<NET>.png  — S/E/I/A/Q/R vs time, old vs new
 # --------------------------------------------------
 
 import time
@@ -38,7 +38,7 @@ TARGET_NETS = ['SBM-1k', 'SBM-2k', 'SBM-3k', 'SBM-4k']
 NET_CONFIGS = {n['name']: n for n in config.TEST_NETWORKS if n['name'] in TARGET_NETS}
 
 import os
-os.makedirs("results", exist_ok=True)
+os.makedirs("plots", exist_ok=True)
 
 # --------------------------------------------------
 # SBM graph builder (self-contained, no dependency on netgen.py)
@@ -100,7 +100,8 @@ def run_old(G_template):
 
 def run_new(G_template, sim_structures):
     """Run pure SEAIRQ on a fresh state array using vectorised new code."""
-    node_index, nodes, adj_csr, block_arr = sim_structures
+    #node_index, nodes, adj_csr, block_arr = sim_structures
+    node_index, nodes, adj_csr, block_arr, edge_index_t, block_id_t = sim_structures
     N = len(nodes)
 
     state_arr = new_ne.initialize_epidemic(N, config.INITIAL_INFECTED)
@@ -244,7 +245,7 @@ for net_name in TARGET_NETS:
         bbox=dict(boxstyle='round,pad=0.4', facecolor='#f0f0f0', edgecolor='#aaaaaa')
     )
 
-    out_png = f"results/compare_curves_{net_name}.png"
+    out_png = f"plots/compare_curves_{net_name}.png"
     fig.savefig(out_png, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved {out_png}")
@@ -254,8 +255,8 @@ for net_name in TARGET_NETS:
 # Summary timing plot  (all 4 networks)
 # --------------------------------------------------
 timing_df = pd.DataFrame(timing_rows)
-timing_df.to_csv("results/compare_timing.csv", index=False)
-print(f"\nSaved results/compare_timing.csv")
+timing_df.to_csv("plots/compare_timing.csv", index=False)
+print(f"\nSaved plots/compare_timing.csv")
 
 summary = (
     timing_df
@@ -303,9 +304,9 @@ ax2.set_ylim(0, max(speedups) * 1.3)
 ax2.grid(axis='y', alpha=0.3)
 
 plt.tight_layout()
-fig.savefig("results/compare_timing_summary.png", dpi=150, bbox_inches='tight')
+fig.savefig("plots/compare_timing_summary.png", dpi=150, bbox_inches='tight')
 plt.close(fig)
-print("Saved results/compare_timing_summary.png")
+print("Saved plots/compare_timing_summary.png")
 
 # --------------------------------------------------
 # Print summary table

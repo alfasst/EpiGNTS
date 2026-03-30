@@ -7,17 +7,22 @@
 # 4. agent.update() receives test_buffer for informed prior
 # 5. GammaPoissonMAB removed
 #
-# Option 1 vectorisation changes:
-# 6. G is no longer deep-copied each run — topology is shared read-only.
-#    build_sim_structures() pre-computes the CSR adjacency and block array
-#    once per graph; only the state array is allocated fresh per run.
-# 7. State is maintained in a NumPy int8 array (state_arr) throughout.
-#    G node 'state' attributes are only synced back via sync_state_to_graph()
-#    immediately before the GNN context builder reads them.
+# Vectorisation (Option 1):
+# 6. G is never deep-copied — topology is shared read-only.
+#    build_sim_structures() pre-computes the CSR adjacency, block array,
+#    precomputed edge_index tensor and block_id tensor once per graph.
+# 7. State lives in a NumPy int8 array (state_arr) throughout.
+#    G.nodes[n]['state'] is only synced back immediately before GNN reads.
 # 8. node_level_testing() works directly on state_arr.
-# 9. Daily state aggregation uses np.bincount on state_arr (O(N), no loop).
+# 9. Daily state aggregation via np.bincount (single O(N) pass).
+#
+# GlobalGNTS optimisation:
+# 10. The full 6-tuple from build_sim_structures is passed as `precomputed`
+#     to GlobalGNTS.__init__ so it can cache edge_index_t and block_id_t
+#     without rebuilding them.
 # --------------------------------------------------
 
+import copy
 from collections import deque
 import numpy as np
 import networkx as nx
@@ -57,27 +62,12 @@ def get_kits_for_day(day: int, schedule) -> int:
 # Node-level testing  (operates on state_arr directly)
 # --------------------------------------------------
 
-def node_level_testing(state_arr, block_arr, block_id, node_index_inv, G, num_kits):
+def node_level_testing(state_arr, block_arr, block_id, nodes, G, num_kits):
     """Test up to num_kits nodes in block_id.
 
-    Priority order: confirmed I first, their S/E/A neighbours second,
+    Priority: confirmed I first, their S/E/A neighbours second,
     remaining S/E/A nodes third.
-
-    state_arr is modified in-place (positives set to Q=4).
-
-    Parameters
-    ----------
-    state_arr      : int8 array (N,) — live state
-    block_arr      : int32 array (N,) — block id per node
-    block_id       : int — which block to test
-    node_index_inv : list — index -> original node id (for neighbour lookup)
-    G              : nx.Graph — used only for neighbour lookup
-    num_kits       : int
-
-    Returns
-    -------
-    positives : dict {state_name: count}
-    wasted    : int
+    state_arr modified in-place (positives set to Q=4).
     """
     if num_kits <= 0:
         return {}, 0
@@ -86,48 +76,33 @@ def node_level_testing(state_arr, block_arr, block_id, node_index_inv, G, num_ki
     if in_block.size == 0:
         return {}, 0
 
-    block_set = set(in_block.tolist())
+    # Local node->idx map for this block's neighbourhood lookup
+    node_to_idx = {nodes[idx]: idx for idx in in_block}
 
-    # Tier 1: infectious I nodes in block
-    tier1 = [idx for idx in in_block if state_arr[idx] == I]
+    # Tier 1: I nodes in block
+    tier1     = [idx for idx in in_block if state_arr[idx] == I]
+    tier1_set = set(tier1)
 
     # Tier 2: S/E/A neighbours of tier1 that are also in block
-    tier2 = []
     tier2_set = set()
     for idx in tier1:
-        node = node_index_inv[idx]
-        for nbr in G.neighbors(node):
-            # node_index_inv is list indexed by contiguous idx;
-            # we need the reverse: node -> idx, available via block_arr
-            # Use G's node ordering — node ids may not equal indices.
-            # We iterate by reconstructing idx from the neighbour node.
-            pass  # handled below via node_to_idx
-
-    # Build a local node->idx map for this block's neighbourhood
-    node_to_idx = {node_index_inv[idx]: idx for idx in in_block}
-
-    tier2_set = set()
-    for idx in tier1:
-        node = node_index_inv[idx]
-        for nbr in G.neighbors(node):
+        for nbr in G.neighbors(nodes[idx]):
             nbr_idx = node_to_idx.get(nbr)
             if nbr_idx is not None and state_arr[nbr_idx] in (S, E, A):
                 tier2_set.add(nbr_idx)
 
-    tier2 = list(tier2_set)
-
-    # Tier 3: remaining S/E/A in block not in tier1 or tier2
-    tier1_set = set(tier1)
+    # Tier 3: remaining S/E/A in block
     tier3 = [
         idx for idx in in_block
-        if state_arr[idx] in (S, E, A) and idx not in tier1_set and idx not in tier2_set
+        if state_arr[idx] in (S, E, A)
+        and idx not in tier1_set
+        and idx not in tier2_set
     ]
 
-    queue = tier1 + tier2 + tier3
-
+    queue     = tier1 + list(tier2_set) + tier3
     positives = {}
-    wasted = 0
-    tested = 0
+    wasted    = 0
+    tested    = 0
 
     for idx in queue:
         if tested >= num_kits:
@@ -136,7 +111,7 @@ def node_level_testing(state_arr, block_arr, block_id, node_index_inv, G, num_ki
         if st in (E, I, A):
             name = STATE_NAMES[st]
             positives[name] = positives.get(name, 0) + 1
-            state_arr[idx] = Q        # quarantine in-place
+            state_arr[idx]  = Q
         else:
             wasted += 1
         tested += 1
@@ -156,27 +131,23 @@ def run_simulation(strategy_name, G_template, sim_structures=None,
     ----------
     strategy_name    : str
     G_template       : nx.Graph — topology + block_id attributes (never mutated)
-    sim_structures   : tuple returned by build_sim_structures(G_template),
-                       or None to build on the fly (slower — pass it in).
+    sim_structures   : 6-tuple from build_sim_structures(G_template), or None.
+                       Pass this in to avoid rebuilding on every run.
     pretrained_gnts  : LocalGNTS | GlobalGNTS | None
-    kits_schedule    : list of (start_day, kits) tuples or None
-
-    Returns
-    -------
-    daily_records, agent, metrics, epoch_losses
+    kits_schedule    : list[(start_day, kits)] or None
     """
     N = G_template.number_of_nodes()
     if N == 0:
         return [], None, {}, []
 
-    # Pre-compute static structures if not supplied
+    # Build static structures if not supplied
     if sim_structures is None:
         sim_structures = build_sim_structures(G_template)
-    node_index, nodes, adj_csr, block_arr = sim_structures
 
+    node_index, nodes, adj_csr, block_arr, edge_index_t, block_id_t = sim_structures
     num_blocks = infer_num_blocks(block_arr)
 
-    # Fresh state array for this run — no deepcopy of G needed
+    # Fresh state array — no deepcopy of G
     state_arr = initialize_epidemic(N, config.INITIAL_INFECTED)
 
     metrics = {
@@ -198,19 +169,22 @@ def run_simulation(strategy_name, G_template, sim_structures=None,
     agent = None
 
     if strategy_name.startswith('LocalGNTS'):
-        agent = (pretrained_gnts.__class__.__new__(pretrained_gnts.__class__)
-                 if False else None)  # placeholder — deepcopy below
-        import copy
         agent = copy.deepcopy(pretrained_gnts) if pretrained_gnts else LocalGNTS(
             G_template, num_blocks, config.GNN_OUTPUT_DIM,
             config.LOCAL_AGENT_CONTEXT_DIM, config.WEIGHT_DECAY,
         )
+
     elif strategy_name.startswith('GlobalGNTS'):
-        import copy
-        agent = copy.deepcopy(pretrained_gnts) if pretrained_gnts else GlobalGNTS(
-            G_template, num_blocks, config.GNN_OUTPUT_DIM,
-            config.GLOBAL_AGENT_CONTEXT_DIM, config.WEIGHT_DECAY,
-        )
+        if pretrained_gnts:
+            agent = copy.deepcopy(pretrained_gnts)
+        else:
+            # Pass precomputed structures so GlobalGNTS never rebuilds them
+            agent = GlobalGNTS(
+                G_template, num_blocks, config.GNN_OUTPUT_DIM,
+                config.GLOBAL_AGENT_CONTEXT_DIM, config.WEIGHT_DECAY,
+                precomputed=sim_structures,
+            )
+
     elif strategy_name.startswith('Beta'):
         mab = BetaBinomialMAB(num_blocks)
 
@@ -223,8 +197,7 @@ def run_simulation(strategy_name, G_template, sim_structures=None,
     for day in range(config.SIMULATION_DAYS):
 
         # --------------------------------------------------
-        # TESTING PHASE — before epidemic step so quarantined
-        # nodes do not spread on this day
+        # TESTING PHASE — before epidemic step
         # --------------------------------------------------
         allocations = np.zeros(num_blocks, dtype=int)
 
@@ -234,7 +207,7 @@ def run_simulation(strategy_name, G_template, sim_structures=None,
             if kits_today > 0:
 
                 if agent:
-                    # GNN needs G.nodes[n]['state'] — sync array → graph
+                    # Sync state array → G so GNN can read node states
                     sync_state_to_graph(G_template, state_arr, nodes)
                     props = agent.get_allocation_proportions(
                         G_template, test_buffer, day, config.SIMULATION_DAYS
@@ -245,9 +218,8 @@ def run_simulation(strategy_name, G_template, sim_structures=None,
                     allocations = np.floor(props * kits_today).astype(int)
                     remainder   = kits_today - allocations.sum()
                     if remainder > 0:
-                        residuals     = props * kits_today - allocations
-                        idx           = np.argsort(residuals)[-remainder:]
-                        allocations[idx] += 1
+                        residuals        = props * kits_today - allocations
+                        allocations[np.argsort(residuals)[-remainder:]] += 1
 
                 elif strategy_name.startswith('Beta'):
                     mab.update_priors(test_buffer)
@@ -257,25 +229,23 @@ def run_simulation(strategy_name, G_template, sim_structures=None,
                             allocations[arm] += 1
 
                 else:
-                    # Heuristics read per-block state counts from state_arr
                     counts = []
                     for bid in range(num_blocks):
-                        in_block = block_arr == bid
-                        block_states = state_arr[in_block]
+                        bstates = state_arr[block_arr == bid]
                         counts.append({
-                            STATE_NAMES[st]: int((block_states == st).sum())
+                            STATE_NAMES[st]: int((bstates == st).sum())
                             for st in range(6)
                         })
-
                     alloc_map = {
                         'Uniform':      uniform_allocation,
                         'Random':       random_allocation,
                         'Proportional': proportional_allocation,
                     }
-                    func        = alloc_map.get(strategy_name, uniform_allocation)
-                    allocations = func(num_blocks, kits_today, current_counts=counts)
+                    allocations = alloc_map.get(
+                        strategy_name, uniform_allocation
+                    )(num_blocks, kits_today, current_counts=counts)
 
-            # Run testing — state_arr modified in-place
+            # Testing — state_arr modified in-place
             daily_results = [{'positive': 0, 'negative': 0} for _ in range(num_blocks)]
             for bid in range(num_blocks):
                 pos, wasted = node_level_testing(
@@ -288,7 +258,7 @@ def run_simulation(strategy_name, G_template, sim_structures=None,
                 metrics['total_positive_tests']     += num_pos
                 metrics['total_wasted_tests']       += wasted
 
-            # GNTS update — sync graph first so GNN context is current
+            # GNTS update — sync graph so GNN context is current
             if agent:
                 sync_state_to_graph(G_template, state_arr, nodes)
                 loss = agent.update(
@@ -300,36 +270,28 @@ def run_simulation(strategy_name, G_template, sim_structures=None,
             test_buffer.append(daily_results)
 
         # --------------------------------------------------
-        # EPIDEMIC STEP — after testing; state_arr modified in-place
+        # EPIDEMIC STEP — after testing
         # --------------------------------------------------
         run_seiqr_step(
-            state_arr,
-            adj_csr,
-            block_arr,
-            config.BETA,
-            config.SIGMA,
-            config.GAMMA,
+            state_arr, adj_csr, block_arr,
+            config.BETA, config.SIGMA, config.GAMMA,
             config.ASYMPTOMATIC_PROB,
-            config.HUB_BLOCK_ID,
-            config.HUB_BETA_MULTIPLIER,
+            config.HUB_BLOCK_ID, config.HUB_BETA_MULTIPLIER,
             config.LONG_RANGE_INFECTION_PROB,
             config.WANING_IMMUNITY_PROB,
         )
 
         # --------------------------------------------------
-        # Daily state aggregation — O(N) bincount, no loop
+        # Daily state aggregation — O(N) bincount
         # --------------------------------------------------
-        counts_today  = np.bincount(state_arr.astype(np.int64), minlength=6)
-        infectious_today = int(counts_today[I] + counts_today[A])
+        c = np.bincount(state_arr.astype(np.int64), minlength=6)
+        infectious_today = int(c[I] + c[A])
 
         daily_records.append({
             'Day': day,
-            'S':   int(counts_today[S]),
-            'E':   int(counts_today[E]),
-            'I':   int(counts_today[I]),
-            'A':   int(counts_today[A]),
-            'Q':   int(counts_today[Q]),
-            'R':   int(counts_today[R]),
+            'S': int(c[S]), 'E': int(c[E]),
+            'I': int(c[I]), 'A': int(c[A]),
+            'Q': int(c[Q]), 'R': int(c[R]),
         })
 
         metrics['integrated_infections'] += infectious_today
