@@ -8,25 +8,22 @@
 # - All summaries & plots are derived from daily data
 
 import os
-import glob
-import pandas as pd
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
 import config
 
-# --------------------------------------------------
+
 # Paths
-# --------------------------------------------------
-RESULTS_DIR = os.path.join("results", "experiments")
+RESULTS_DIR = os.path.join("results")
 NET_METRICS_FILE = os.path.join("results", "network_metrics.csv")
-PLOTS_DIR = os.path.join("results", "plots")
+PLOTS_DIR = os.path.join("plots")
 
 os.makedirs(PLOTS_DIR, exist_ok=True)
 
-# --------------------------------------------------
+
 # Canonical lists
-# --------------------------------------------------
 NETWORKS = [n['name'] for n in config.TEST_NETWORKS] + \
            [n['name'] for n in config.SNAP_NETWORKS]
 
@@ -34,16 +31,13 @@ STRATEGIES = [
     "Uniform",
     "Random",
     "Proportional",
-    "Beta",
-    "Gamma",
+    "Beta-14",
     "LocalGNTS",
     "GlobalGNTS"
 ]
 
-# --------------------------------------------------
-# Utilities
-# --------------------------------------------------
 
+# Utilities
 def load_existing_daily_csvs():
     """Load all existing (Network, Strategy) daily CSVs."""
     data = {}
@@ -69,10 +63,7 @@ def add_derived_columns(df):
     return df
 
 
-# --------------------------------------------------
 # Metric computations
-# --------------------------------------------------
-
 def compute_summary(daily_data):
     """Compute Network–Strategy level summary from daily data."""
     records = []
@@ -95,10 +86,7 @@ def compute_summary(daily_data):
     return pd.DataFrame(records)
 
 
-# --------------------------------------------------
 # Plotting
-# --------------------------------------------------
-
 def plot_qeff_vs_time(daily_data):
     """Plot quarantine efficiency vs time (one plot per network)."""
 
@@ -152,10 +140,7 @@ def plot_qeff_vs_network_metrics(summary):
         plt.close(fig)
 
 
-# --------------------------------------------------
 # Main
-# --------------------------------------------------
-
 if __name__ == '__main__':
     print("Loading existing daily CSVs...")
     daily_data = load_existing_daily_csvs()

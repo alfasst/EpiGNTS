@@ -1,254 +1,160 @@
 # main.py
-# Unified experiment runner (per-network–per-strategy daily CSVs)
-# --------------------------------------------------
-# Changes vs previous version:
-# 1. GNTS training uses N-agent ensemble weight averaging instead of
-#    keeping only the last sequential agent. Each of the N_TRAINING_RUNS
-#    produces an independent agent; their weights are averaged into a
-#    stable master model before testing begins.
-# 2. average_gnts_agents() covers both LocalGNTS (ModuleList weights)
-#    and GlobalGNTS (single-module weights) uniformly.
-# 3. "Gamma" removed from STRATEGIES list.
-
+import csv
+import collections
 import os
-import pickle
-import argparse
-from collections import defaultdict, OrderedDict
-from tqdm import tqdm
-import torch
+
+import numpy as np
 import pandas as pd
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import networkx as nx
 
 import config
 from simulation import run_simulation
-from gnts import LocalGNTS, GlobalGNTS
 
-# --------------------------------------------------
-# Paths
-# --------------------------------------------------
-GPICKLE_DIR = os.path.join("results", "gpickle")
-MODEL_DIR   = os.path.join("results", "models")
-RESULTS_DIR = os.path.join("results", "experiments")
+GPICKLE_DIR = "gpickle"
 
-os.makedirs(MODEL_DIR,   exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
+ALL_NETWORKS = config.SBM_NETWORKS + config.SNAP_NETWORKS
 
-# --------------------------------------------------
-# Strategies
-# --------------------------------------------------
-STRATEGIES = [
+strategies_to_run = [
+    "LocalGNTS-14",
+    "Beta-Binomial-14",
+    "Gamma-Poisson-14",
+    "Proportional",
     "Uniform",
     "Random",
-    "Proportional",
-    "Beta",
-    "LocalGNTS",
-    "GlobalGNTS",
 ]
 
-SNAP_NAMES = {"Orkut", "LiveJournal", "Youtube"}
 
-# --------------------------------------------------
-# Utilities
-# --------------------------------------------------
+def export_daily_results(results, filename):
+    header = [
+        "Day",
+        "Strategy",
+        "S_avg",
+        "E_avg",
+        "I_avg",
+        "A_avg",
+        "Q_avg",
+        "R_avg",
+        "Efficiency_avg",
+    ]
+    with open(filename, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        for strategy_name, histories_list in results.items():
+            avg_daily_counts = []
+            for day in range(config.SIMULATION_DAYS):
+                day_run_totals = []
+                for history in histories_list:
+                    run_total = collections.Counter()
+                    for block_data in history[day]:
+                        run_total.update(block_data)
+                    day_run_totals.append(run_total)
+                avg_counts_for_day = collections.Counter()
+                for run_total in day_run_totals:
+                    avg_counts_for_day.update(run_total)
+                for k in avg_counts_for_day:
+                    avg_counts_for_day[k] /= len(histories_list)
+                avg_daily_counts.append(avg_counts_for_day)
+            for day, counts in enumerate(avg_daily_counts):
+                s, e, i, a, q, r = [
+                    counts.get(st, 0) for st in ["S", "E", "I", "A", "Q", "R"]
+                ]
+                denominator = i + e + a + q
+                efficiency = q / denominator if denominator > 0 else 0
+                row = [day, strategy_name, s, e, i, a, q, r, efficiency]
+                writer.writerow(row)
 
-def load_graph(short_name: str):
-    path = os.path.join(GPICKLE_DIR, f"{short_name}.gpickle")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Network pickle not found: {path}")
-    with open(path, 'rb') as f:
-        return pickle.load(f)
+
+def plot_efficiency(results, filename):
+    plt.style.use("seaborn-v0_8-whitegrid")
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    strat_name = {
+        "LocalGNTS-14": "GNTS",
+        "Beta-Binomial-14": "BBTS",
+        "Gamma-Poisson-14": "GPTS",
+        "Proportional": "Proportional",
+        "Uniform": "Uniform",
+        "Random": "Random",
+    }
+
+    for strategy_name, histories_list in results.items():
+        all_runs_efficiencies = []
+        for history in histories_list:
+            quarantine_efficiency = []
+            for day_data in history:
+                total_counts = collections.Counter()
+                for block_data in day_data:
+                    total_counts.update(block_data)
+                i, e, a, q = [total_counts.get(s, 0) for s in ["I", "E", "A", "Q"]]
+                denominator = i + e + a + q
+                efficiency = q / denominator if denominator > 0 else 0
+                quarantine_efficiency.append(efficiency)
+            all_runs_efficiencies.append(quarantine_efficiency)
+        avg_efficiency = np.mean(all_runs_efficiencies, axis=0)
+        label = strat_name.get(strategy_name, strategy_name)
+        ax.plot(avg_efficiency, label=label, lw=2)
+
+    ax.axvline(x=config.TESTING_START_DAY, color="black", linestyle="--")
+    ax.set_xlabel("Day", fontsize=14)
+    ax.set_ylabel("Avg. Quarantine Efficiency (Q / (I+E+A+Q))", fontsize=14)
+    ax.legend(title="Strategy", fontsize=12, frameon=True)
+    ax.grid(True)
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close(fig)
 
 
-def get_model_path(strategy: str, network: str) -> str:
-    return os.path.join(MODEL_DIR, f"{strategy}_{network}.pt")
+for net_config in ALL_NETWORKS:
+    net_name = net_config["name"]
+    gpickle_path = os.path.join(GPICKLE_DIR, f"{net_name}.gpickle")
 
+    if not os.path.exists(gpickle_path):
+        print(f"Skipping {net_name}: gpickle not found at {gpickle_path}")
+        continue
 
-def _infer_num_blocks(G) -> int:
-    block_ids = [d.get('block_id') for _, d in G.nodes(data=True)
-                 if isinstance(d.get('block_id'), int)]
-    return max(block_ids) + 1 if block_ids else 0
+    print(f"\nLoading network: {net_name}")
+    G = nx.read_gpickle(gpickle_path)
+    config.NUM_BLOCKS = len(set(nx.get_node_attributes(G, "block_id").values()))
 
+    print(f"--- TRAINING PHASE FOR LocalGNTS on {net_name} ---")
+    from strategies import LocalGNTS, average_gnts_bandits
+    from simulation import run_simulation
 
-def _make_agent(strategy: str, G, num_blocks: int):
-    """Instantiate a fresh LocalGNTS or GlobalGNTS for the given network."""
-    if strategy == "LocalGNTS":
-        return LocalGNTS(
-            G, num_blocks,
-            config.GNN_OUTPUT_DIM,
-            config.LOCAL_AGENT_CONTEXT_DIM,
-            config.WEIGHT_DECAY,
-        )
-    return GlobalGNTS(
-        G, num_blocks,
-        config.GNN_OUTPUT_DIM,
-        config.GLOBAL_AGENT_CONTEXT_DIM,
+    trained_agents = []
+    for i in tqdm(range(config.N_TRAINING_RUNS), desc=f"Training {net_name}"):
+        _, trained_agent, _ = run_simulation("LocalGNTS-14", G)
+        trained_agents.append(trained_agent)
+
+    master_agent_template = LocalGNTS(
+        G,
+        config.NUM_BLOCKS,
+        config.LOCAL_GNN_OUTPUT_DIM,
+        config.LOCAL_GNTS_CONTEXT_DIM,
         config.WEIGHT_DECAY,
     )
+    master_agent = average_gnts_bandits(trained_agents, master_agent_template)
 
+    print(f"\n--- TESTING PHASE FOR {net_name} ---")
+    all_test_results = collections.defaultdict(list)
+    all_test_metrics = collections.defaultdict(list)
 
-def average_gnts_agents(agents: list, strategy: str, G, num_blocks: int):
-    """Average the weights of N independently trained agents into one master.
+    for i in tqdm(range(config.N_TESTING_RUNS), desc=f"Testing {net_name}"):
+        for strategy in strategies_to_run:
+            pretrained_model = (
+                master_agent if strategy.startswith("LocalGNTS") else None
+            )
+            history, _, metrics = run_simulation(
+                strategy, G, pretrained_gnts=pretrained_model
+            )
+            all_test_results[strategy].append(history)
+            all_test_metrics[strategy].append(metrics)
 
-    LocalGNTS stores per-block ModuleLists (local_gnns, prior_boosters).
-    GlobalGNTS stores single modules (global_gnn, prior_booster).
-    Both cases are handled uniformly: collect state_dicts, stack tensors,
-    take the element-wise mean, load into a fresh template.
-    """
-    master = _make_agent(strategy, G, num_blocks)
+    csv_filename = f"{net_name}_daily.csv"
+    export_daily_results(all_test_results, csv_filename)
+    print(f"Daily CSV exported: {csv_filename}")
 
-    if strategy == "LocalGNTS":
-        # Each attribute is a ModuleList — average per sub-module
-        for attr in ('local_gnns', 'prior_boosters'):
-            module_list = getattr(master, attr)
-            for idx in range(len(module_list)):
-                avg_sd = OrderedDict()
-                for key in module_list[idx].state_dict().keys():
-                    avg_sd[key] = torch.stack(
-                        [getattr(a, attr)[idx].state_dict()[key] for a in agents]
-                    ).mean(dim=0)
-                module_list[idx].load_state_dict(avg_sd)
-
-    else:  # GlobalGNTS
-        # Each attribute is a plain nn.Module — average directly
-        for attr in ('global_gnn', 'prior_booster'):
-            ref_module = getattr(master, attr)
-            avg_sd = OrderedDict()
-            for key in ref_module.state_dict().keys():
-                avg_sd[key] = torch.stack(
-                    [getattr(a, attr).state_dict()[key] for a in agents]
-                ).mean(dim=0)
-            ref_module.load_state_dict(avg_sd)
-
-    return master
-
-
-# --------------------------------------------------
-# Main execution
-# --------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--network",
-        type=str,
-        default=None,
-        help="Run experiments for a single network (short name)",
-    )
-    args = parser.parse_args()
-
-    sbm_names  = [net['name'] for net in config.TEST_NETWORKS]
-    snap_names = [net['name'] for net in config.SNAP_NETWORKS]
-    all_networks = sbm_names + snap_names
-
-    if args.network:
-        if args.network not in all_networks:
-            raise ValueError(f"Unknown network: {args.network}")
-        networks = [args.network]
-    else:
-        networks = all_networks
-
-    for net_name in networks:
-        print(f"\n=== Network: {net_name} ===")
-        G = load_graph(net_name)
-        num_blocks = _infer_num_blocks(G)
-
-        # Budget scaling for large SNAP networks
-        if net_name in SNAP_NAMES:
-            kits_schedule = [(d, 2 * k) for d, k in config.KITS_SCHEDULE]
-        else:
-            kits_schedule = config.KITS_SCHEDULE
-            
-        sim_structures = build_sim_structures(G)
-
-        for strategy in STRATEGIES:
-            print(f"  Strategy: {strategy}")
-
-            out_csv = os.path.join(RESULTS_DIR, f"{net_name}__{strategy}_daily.csv")
-
-            if os.path.exists(out_csv):
-                print(f"    ✓ Daily CSV already exists, skipping")
-                continue
-
-            pretrained = None
-            model_path = get_model_path(strategy, net_name)
-
-            # ----------------------
-            # GNTS training
-            # ----------------------
-            if strategy in ("LocalGNTS", "GlobalGNTS"):
-                if os.path.exists(model_path):
-                    # Load previously saved master model
-                    print("    ✓ Using pretrained GNTS")
-                    pretrained = _make_agent(strategy, G, num_blocks)
-                    pretrained.load_model(model_path)
-
-                else:
-                    # Train N independent agents, then average their weights
-                    print(f"    → Training GNTS ensemble ({config.N_TRAINING_RUNS} agents)")
-                    trained_agents = []
-
-                    for _ in tqdm(range(config.N_TRAINING_RUNS)):
-                    
-                        _, agent, _, _ = run_simulation(
-                            strategy, G,
-                            sim_structures=sim_structures,
-                            kits_schedule=kits_schedule,
-                            )
-                       
-                        if agent is not None:
-                            trained_agents.append(agent)
-
-                    if trained_agents:
-                        print(f"    → Averaging {len(trained_agents)} agents into master")
-                        pretrained = average_gnts_agents(
-                            trained_agents, strategy, G, num_blocks
-                        )
-                        pretrained.save_model(model_path)
-                        print(f"    ✓ Master model saved to {model_path}")
-                    else:
-                        print("    ✗ No agents produced — skipping GNTS testing")
-                        continue
-
-            # ----------------------
-            # Testing runs (aggregate per day)
-            # ----------------------
-            daily_accumulator = defaultdict(list)
-
-            for run in range(config.N_TESTING_RUNS):
-                daily_records, _, metrics, _ = run_simulation(
-                            strategy, G,
-                            sim_structures=sim_structures,
-                            kits_schedule=kits_schedule,
-                            )
-
-                for rec in daily_records:
-                    day = rec['Day']
-                    daily_accumulator[day].append({
-                        'S': rec['S'],
-                        'E': rec['E'],
-                        'I': rec['I'],
-                        'A': rec['A'],
-                        'Q': rec['Q'],
-                        'R': rec['R'],
-                        'total_tests_administered': metrics['total_tests_administered'],
-                        'total_positive_tests':     metrics['total_positive_tests'],
-                        'total_wasted_tests':        metrics['total_wasted_tests'],
-                    })
-
-            # ----------------------
-            # Average over runs (per day)
-            # ----------------------
-            rows = []
-            for day in sorted(daily_accumulator.keys()):
-                df_day = pd.DataFrame(daily_accumulator[day])
-                row = {'Day': day}
-                for col in df_day.columns:
-                    row[col] = df_day[col].mean()
-                rows.append(row)
-
-            df_out = pd.DataFrame(rows)
-            df_out.to_csv(out_csv, index=False)
-            print(f"    ✓ Saved {out_csv}")
-
-
-if __name__ == '__main__':
-    main()
+    svg_filename = f"{net_name}.svg"
+    plot_efficiency(all_test_results, svg_filename)
+    print(f"Efficiency SVG exported: {svg_filename}")

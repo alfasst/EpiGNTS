@@ -1,26 +1,15 @@
 # config.py
-# Static experiment configuration (SHORT NAMES ONLY)
-# --------------------------------------------------
-# Design rules:
-# - Short names are the ONLY network identifiers
-# - No runtime mutation
-# - No name mapping / aliases
 
-# --------------------------------------------------
-# Run control
-# --------------------------------------------------
-N_TRAINING_RUNS = 150
+# --- Run Control Parameters ---
+# CHANGED: Increased training runs for the new model
+N_TRAINING_RUNS = 100
 N_TESTING_RUNS = 5
+
+# --- Simulation Parameters ---
 SIMULATION_DAYS = 150
 
-# --------------------------------------------------
-# SBM network configurations (9 networks)
-# --------------------------------------------------
-# Naming convention:
-# SBM-1k, SBM-2k, SBM-3k, SBM-4k,
-# SBM-5k-Zero, SBM-5k-Low, SBM-5k-Med, SBM-5k-High, SBM-5k-Max
-
-TEST_NETWORKS = [
+# --- Network Parameters ---
+SBM_NETWORKS = [
     {
         "name": "SBM-1k",
         "block_sizes": [100] * 10,
@@ -77,9 +66,6 @@ TEST_NETWORKS = [
     },
 ]
 
-# --------------------------------------------------
-# SNAP network configurations (short names)
-# --------------------------------------------------
 
 SNAP_NETWORKS = [
     {
@@ -99,45 +85,22 @@ SNAP_NETWORKS = [
     }
 ]
 
-# --------------------------------------------------
-# Epidemic parameters (SEAIRQ)
-# --------------------------------------------------
-BETA = 0.05
-SIGMA = 1 / 5.0
-GAMMA = 1 / 14.0
-INITIAL_INFECTED = 10
-ASYMPTOMATIC_PROB = 0.4
-LONG_RANGE_INFECTION_PROB = 0.01
-WANING_IMMUNITY_PROB = 1 / 180
+# --- Epidemic Parameters ---
+BETA = 0.05; SIGMA = 1/5.0; GAMMA = 1/14.0; INITIAL_INFECTED = 10
+ASYMPTOMATIC_PROB = 0.4; LONG_RANGE_INFECTION_PROB = 0.01; WANING_IMMUNITY_PROB = 1/180
 
-# --------------------------------------------------
-# Heterogeneity (SBM-specific, ignored if invalid)
-# --------------------------------------------------
-HUB_BLOCK_ID = 1
-HUB_BETA_MULTIPLIER = 2.0
+# --- Heterogeneity Parameters ---
+HUB_BLOCK_ID = 1; HUB_BETA_MULTIPLIER = 2.0
 
-# --------------------------------------------------
-# Testing & intervention
-# --------------------------------------------------
+# --- Intervention Parameters ---
 TESTING_START_DAY = 20
-KITS_SCHEDULE = [
-    (20, 10),
-    (40, 25),
-    (60, 40),
-    (80, 50)
-]
+KITS_SCHEDULE = [(20, 10), (40, 25), (60, 40), (80, 50)]
+WARM_START_DAYS = 7; EXPLORATION_BUDGET_FRACTION = 0.1
 
-# --------------------------------------------------
-# GNTS / learning parameters
-# --------------------------------------------------
-GNN_OUTPUT_DIM = 16
-LOCAL_AGENT_CONTEXT_DIM = GNN_OUTPUT_DIM + 1
-GLOBAL_AGENT_CONTEXT_DIM = GNN_OUTPUT_DIM + 1
+# --- Agent Parameters ---
+# NEW: Parameters for the LocalGNTS agent
+LOCAL_GNN_OUTPUT_DIM = 8
+# Context is Local GNN output + 1 for time
+LOCAL_GNTS_CONTEXT_DIM = LOCAL_GNN_OUTPUT_DIM + 1
 WEIGHT_DECAY = 1e-4
 
-# --------------------------------------------------
-# Design rule (DO NOT VIOLATE)
-# --------------------------------------------------
-# This file is STATIC.
-# Do not mutate configuration values at runtime.
-# Network-specific structure must be inferred from the graph itself.
