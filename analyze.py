@@ -16,50 +16,58 @@ import config
 
 
 # Paths
-RESULTS_DIR = os.path.join("results")
-NET_METRICS_FILE = os.path.join("results", "network_metrics.csv")
-PLOTS_DIR = os.path.join("plots")
+RESULTS_DIR      = "csvs"
+NET_METRICS_FILE = os.path.join("csvs", "network_metrics.csv")
+PLOTS_DIR        = "plots"
 
 os.makedirs(PLOTS_DIR, exist_ok=True)
 
 
 # Canonical lists
-NETWORKS = [n['name'] for n in config.TEST_NETWORKS] + \
+NETWORKS = [n['name'] for n in config.SBM_NETWORKS] + \
            [n['name'] for n in config.SNAP_NETWORKS]
 
 STRATEGIES = [
+    "LocalGNTS-14",
+    "Beta-Binomial-14",
+    "Proportional",
     "Uniform",
     "Random",
-    "Proportional",
-    "Beta-14",
-    "LocalGNTS",
-    "GlobalGNTS"
 ]
+
+
+def _strategy_to_filename(strat):
+    """Match the naming convention used in main.py."""
+    return strat.replace("-", "_")
 
 
 # Utilities
 def load_existing_daily_csvs():
     """Load all existing (Network, Strategy) daily CSVs."""
     data = {}
-
     for net in NETWORKS:
         for strat in STRATEGIES:
-            path = os.path.join(RESULTS_DIR, f"{net}__{strat}_daily.csv")
+            path = os.path.join(RESULTS_DIR,
+                                f"{net}_{_strategy_to_filename(strat)}.csv")
             if os.path.exists(path):
-                df = pd.read_csv(path)
-                data[(net, strat)] = df
+                data[(net, strat)] = pd.read_csv(path)
     return data
 
 
 def add_derived_columns(df):
+    """
+    Add computed columns used by both summary and plotting.
+    CSV columns available: Day, S_avg, E_avg, I_avg, A_avg, Q_avg, R_avg,
+                           Efficiency_avg
+    """
     df = df.copy()
-    denom = df['E'] + df['I'] + df['A'] + df['Q']
-    df['quarantine_efficiency'] = np.where(denom > 0, df['Q'] / denom, 0.0)
-    df['infectious'] = df['I'] + df['A']
-    df['positive_test_rate'] = (
-        df['total_positive_tests'] /
-        df['total_tests_administered'].replace(0, np.nan)
-    ).fillna(0.0)
+    denom = df['E_avg'] + df['I_avg'] + df['A_avg'] + df['Q_avg']
+    df['quarantine_efficiency'] = np.where(denom > 0, df['Q_avg'] / denom, 0.0)
+    df['infectious']            = df['I_avg'] + df['A_avg']
+    # Positive test rate: use the pre-computed Efficiency_avg column
+    # (Q / (E+I+A+Q) already stored) as the proxy for positive test rate,
+    # since raw test counts are not stored in the daily CSVs.
+    df['positive_test_rate']    = df['Efficiency_avg']
     return df
 
 
@@ -71,16 +79,17 @@ def compute_summary(daily_data):
     for (net, strat), df in daily_data.items():
         df = add_derived_columns(df)
 
+        peak_idx = df['infectious'].idxmax()
         peak_val = df['infectious'].max()
-        t_peak = df.loc[df['infectious'].idxmax(), 'Day']
+        t_peak   = df.loc[peak_idx, 'Day']
 
         records.append({
-            'Network': net,
-            'Strategy': strat,
-            'avg_quarantine_efficiency': df['quarantine_efficiency'].mean(),
-            'peak_infections': peak_val,
-            'time_to_peak': t_peak,
-            'positive_test_rate': df['positive_test_rate'].iloc[0]
+            'Network':                  net,
+            'Strategy':                 strat,
+            'avg_quarantine_efficiency': round(df['quarantine_efficiency'].mean(), 4),
+            'peak_infections':           round(peak_val, 2),
+            'time_to_peak':              int(t_peak),
+            'positive_test_rate':        round(df['positive_test_rate'].mean(), 4),
         })
 
     return pd.DataFrame(records)
@@ -88,8 +97,7 @@ def compute_summary(daily_data):
 
 # Plotting
 def plot_qeff_vs_time(daily_data):
-    """Plot quarantine efficiency vs time (one plot per network)."""
-
+    """One plot per network: quarantine efficiency over time for all strategies."""
     for net in NETWORKS:
         fig, ax = plt.subplots()
         plotted = False
@@ -98,7 +106,6 @@ def plot_qeff_vs_time(daily_data):
             key = (net, strat)
             if key not in daily_data:
                 continue
-
             df = add_derived_columns(daily_data[key])
             ax.plot(df['Day'], df['quarantine_efficiency'], label=strat)
             plotted = True
@@ -115,13 +122,21 @@ def plot_qeff_vs_time(daily_data):
         out = os.path.join(PLOTS_DIR, f"qeff_vs_time_{net}.svg")
         fig.savefig(out, format='svg')
         plt.close(fig)
+        print(f"  Saved {out}")
 
 
 def plot_qeff_vs_network_metrics(summary):
+    """Scatter plots of avg quarantine efficiency against network-level metrics."""
+    if not os.path.exists(NET_METRICS_FILE):
+        print(f"  Skipping network-metric plots: {NET_METRICS_FILE} not found.")
+        return
+
     net_metrics = pd.read_csv(NET_METRICS_FILE)
-    merged = summary.merge(net_metrics, on='Network', how='left')
+    merged      = summary.merge(net_metrics, on='Network', how='left')
 
     for metric in ['Modularity', 'Clustering', 'Stiffness', 'Nodes']:
+        if metric not in merged.columns:
+            continue
         fig, ax = plt.subplots()
 
         for strat in STRATEGIES:
@@ -138,6 +153,7 @@ def plot_qeff_vs_network_metrics(summary):
         out = os.path.join(PLOTS_DIR, f"qeff_vs_{metric.lower()}.svg")
         fig.savefig(out, format='svg')
         plt.close(fig)
+        print(f"  Saved {out}")
 
 
 # Main
@@ -148,7 +164,7 @@ if __name__ == '__main__':
     if not daily_data:
         raise RuntimeError("No daily CSVs found. Run main.py first.")
 
-    print(f"Loaded {len(daily_data)} (network, strategy) datasets")
+    print(f"Loaded {len(daily_data)} (network, strategy) datasets.")
 
     print("Computing summary metrics...")
     summary = compute_summary(daily_data)
@@ -161,4 +177,4 @@ if __name__ == '__main__':
     plot_qeff_vs_time(daily_data)
     plot_qeff_vs_network_metrics(summary)
 
-    print(f"All plots saved to {PLOTS_DIR}")
+    print(f"Done. All plots saved to {PLOTS_DIR}/")

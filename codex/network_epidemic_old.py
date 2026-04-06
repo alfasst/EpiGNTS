@@ -1,117 +1,76 @@
 # network_epidemic.py
-# Revised version
-# Scope:
-# - Epidemic dynamics only (SEAIRQ)
-# - NO network generation
-# - NO dependence on mutable global config for block counts
 
 import networkx as nx
 import random
 import config
 
-# --------------------------------------------------
-# Epidemic initialization
-# --------------------------------------------------
+def create_sbm_network(block_sizes, p_in, p_out):
+    """CHANGED: Creates an SBM network from a list of block sizes."""
+    num_nodes = sum(block_sizes)
+    prob_matrix = [[p_out] * len(block_sizes) for _ in range(len(block_sizes))]
+    for i in range(len(block_sizes)):
+        prob_matrix[i][i] = p_in
+    
+    G = nx.stochastic_block_model(block_sizes, prob_matrix, seed=42)
+    
+    current_size = 0
+    for i, size in enumerate(block_sizes):
+        for node_idx in range(size):
+            node_id = current_size + node_idx
+            G.nodes[node_id]['block_id'] = i
+        current_size += size
+            
+    print(f"✅ Network created with {num_nodes} nodes and uneven blocks.")
+    return G
 
 def initialize_epidemic(G, num_initial):
-    """Initializes node states for the SEAIRQ model.
-    All nodes start as Susceptible ('S'), with num_initial set to Infected ('I').
-    """
-    if G.number_of_nodes() == 0:
-        return
+    """Initializes node states for the SEAIRQ model."""
+    for node in G.nodes():
+        G.nodes[node]['state'] = 'S'
+    initial_nodes = random.sample(list(G.nodes()), num_initial)
+    for node in initial_nodes:
+        G.nodes[node]['state'] = 'I'
+    print(f"🦠 Epidemic seeded with {num_initial} infections.")
 
-    nx.set_node_attributes(G, 'S', 'state')
-
-    num_initial = min(num_initial, G.number_of_nodes())
-    if num_initial <= 0:
-        return
-
-    try:
-        infected = random.sample(list(G.nodes()), num_initial)
-        nx.set_node_attributes(G, {n: 'I' for n in infected}, 'state')
-    except ValueError:
-        pass
-
-
-# --------------------------------------------------
-# SEAIRQ dynamics (single time step)
-# --------------------------------------------------
-
-def run_seiqr_step(
-    G,
-    beta,
-    sigma,
-    gamma,
-    asymptomatic_prob,
-    hub_id,
-    hub_multiplier,
-    long_range_prob,
-    waning_prob
-):
-    """Advance epidemic state by one day using SEAIRQ dynamics."""
-
-    if G.number_of_nodes() == 0:
-        return
-
-    # Infer number of blocks directly from graph
-    block_ids = nx.get_node_attributes(G, 'block_id')
-    num_blocks = max(block_ids.values()) + 1 if block_ids else 0
-    is_hub_valid = 0 <= hub_id < num_blocks
-
+def run_seiqr_step(G, beta, sigma, gamma, asymptomatic_prob, hub_id, hub_multiplier, long_range_prob, waning_prob):
+    """CHANGED: Advances the epidemic, now including R -> S waning immunity."""
     new_states = {}
-    newly_exposed = set()
-
-    susceptible_nodes = [n for n, d in G.nodes(data=True) if d.get('state') == 'S']
+    nodes_to_become_exposed = set()
+    all_susceptible = [n for n, d in G.nodes(data=True) if d['state'] == 'S']
 
     for node, data in G.nodes(data=True):
-        state = data.get('state', 'S')
-        block_id = data.get('block_id', -1)
-
-        # ----------------------
-        # Infectious (I, A)
-        # ----------------------
-        if state in ('I', 'A'):
-            eff_beta = beta * hub_multiplier if (is_hub_valid and block_id == hub_id) else beta
-
-            # Local transmission
-            for nbr in G.neighbors(node):
-                if G.nodes[nbr].get('state') == 'S':
-                    if random.random() < eff_beta:
-                        newly_exposed.add(nbr)
-
-            # Long-range infection
-            if susceptible_nodes and random.random() < long_range_prob:
-                newly_exposed.add(random.choice(susceptible_nodes))
-
-            # Recovery
+        state = data['state']
+        if state in ['I', 'A']:
+            current_beta = beta * hub_multiplier if data['block_id'] == hub_id else beta
+            for neighbor in G.neighbors(node):
+                if G.nodes[neighbor]['state'] == 'S' and random.random() < current_beta:
+                    nodes_to_become_exposed.add(neighbor)
+            if random.random() < long_range_prob and all_susceptible:
+                spark_victim = random.choice(all_susceptible)
+                nodes_to_become_exposed.add(spark_victim)
             if random.random() < gamma:
                 new_states[node] = 'R'
 
-        # ----------------------
-        # Exposed (E)
-        # ----------------------
         elif state == 'E':
             if random.random() < sigma:
-                new_states[node] = 'A' if random.random() < asymptomatic_prob else 'I'
-
-        # ----------------------
-        # Quarantined (Q)
-        # ----------------------
+                if random.random() < asymptomatic_prob:
+                    new_states[node] = 'A'
+                else:
+                    new_states[node] = 'I'
+        
         elif state == 'Q':
             if random.random() < gamma:
                 new_states[node] = 'R'
-
-        # ----------------------
-        # Recovered (R)
-        # ----------------------
+        
+        # NEW: Recovered individuals can become susceptible again
         elif state == 'R':
             if random.random() < waning_prob:
                 new_states[node] = 'S'
 
-    # Apply newly exposed nodes
-    for node in newly_exposed:
-        if node not in new_states and G.nodes[node].get('state') == 'S':
+    for node in nodes_to_become_exposed:
+        if node not in new_states:
             new_states[node] = 'E'
-
-    nx.set_node_attributes(G, new_states, 'state')
+            
+    for node, state in new_states.items():
+        G.nodes[node]['state'] = state
 
