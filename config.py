@@ -99,8 +99,8 @@ WARM_START_DAYS = 7; EXPLORATION_BUDGET_FRACTION = 0.1
 
 # --- Agent Parameters ---
 # NEW: Parameters for the LocalGNTS agent
-LOCAL_GNN_OUTPUT_DIM = 8
+GNN_OUTPUT_DIM = 8
 # Context is Local GNN output + 1 for time
-LOCAL_GNTS_CONTEXT_DIM = LOCAL_GNN_OUTPUT_DIM + 1
+GNTS_CONTEXT_DIM = GNN_OUTPUT_DIM + 1
 WEIGHT_DECAY = 1e-4
 

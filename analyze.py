@@ -28,7 +28,7 @@ NETWORKS = [n['name'] for n in config.SBM_NETWORKS] + \
            [n['name'] for n in config.SNAP_NETWORKS]
 
 STRATEGIES = [
-    "LocalGNTS-14",
+    "LocalGNTS-14", "GlobalGNTS-14",
     "Beta-Binomial-14",
     "Proportional",
     "Uniform",
