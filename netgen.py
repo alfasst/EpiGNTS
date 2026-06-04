@@ -28,8 +28,8 @@ TOP_N_COMMUNITIES_SNAP = 20
 # --------------------------------------------------
 # Paths
 # --------------------------------------------------
-GPICKLE_DIR = os.path.join("results", "gpickle")
-METRICS_FILE = os.path.join("results", "network_metrics.csv")
+GPICKLE_DIR = os.path.join("gpickle")
+METRICS_FILE = os.path.join("csvs", "network_metrics.csv")
 
 os.makedirs(GPICKLE_DIR, exist_ok=True)
 
@@ -240,7 +240,7 @@ if __name__ == '__main__':
     all_metrics = []
 
     print("Processing SBM networks...")
-    for net in tqdm(config.TEST_NETWORKS):
+    for net in tqdm(config.SBM_NETWORKS):
         name = net['name']
         gpath = os.path.join(GPICKLE_DIR, f"{name}.gpickle")
 
