@@ -5,7 +5,7 @@ Generates:
 1. Scaling line plot for training times (seconds_per_iteration).
 2. Summary CSV of all peak shift experiments.
 3. Individual line plots of Detection Ratio per network per scenario.
-4. Heatmaps of Detection Ratio (Nodes vs Peak Day) for Local and Global GNTS.
+4. A single Heatmap of Detection Ratio (Method vs Peak Day).
 
 Usage:
     pip install seaborn
@@ -132,7 +132,7 @@ def process_peak_shift_experiments(csv_dir, out_dir):
 
     scenarios = ["Peak_25", "Peak_40", "Peak_60", "Peak_80", "Peak_100"]
     strategies = ["LocalGNTS_14", "GlobalGNTS_14", "Beta_Binomial_14", "Proportional", "Uniform", "Random"]
-    networks = ["SBM-1k", "SBM-2k", "SBM-3k", "SBM-4k", "SBM-5k-Med"]
+    networks = ["SBM-5k-Med"] # Locked to the single network used in the updated experiment
 
     print("\nProcessing Peak Shift Data (CSVs and Line Plots)...")
     summary_records = []
@@ -199,36 +199,41 @@ def process_peak_shift_experiments(csv_dir, out_dir):
     summary_df = pd.DataFrame(summary_records)
     csv_out_path = os.path.join(out_dir, "summary_peak_shift.csv")
     
-    # Reorder columns for the final CSV as requested
+    # Reorder columns for the final CSV
     export_df = summary_df[["expt_name", "network_name", "infection_peak", "model", "detection_ratio"]]
     export_df.to_csv(csv_out_path, index=False)
     print(f"  Saved Summary CSV: {csv_out_path}")
 
-    # 3. Generate Heatmaps
-    print("Generating GNTS Heatmaps...")
-    for model_name in ["LocalGNTS_14", "GlobalGNTS_14"]:
-        model_df = summary_df[summary_df["model"] == model_name]
-        if model_df.empty:
-            continue
-        
-        # Pivot the data: X = num_nodes, Y = target_peak_label, Value = detection_ratio
-        pivot_df = model_df.pivot(index="target_peak_label", columns="num_nodes", values="detection_ratio")
+    # 3. Generate Single Heatmap (Method vs Peak)
+    print("Generating Detection Ratio Heatmap...")
+    if not summary_df.empty:
+        # Pivot the data: X = model, Y = target_peak_label, Value = detection_ratio
+        # Use pivot_table with 'mean' to gracefully handle any potential duplicate rows
+        pivot_df = summary_df.pivot_table(index="target_peak_label", columns="model", values="detection_ratio", aggfunc='mean')
         
         # Sort Y-axis descending so the latest peak (100) is at the top
         pivot_df = pivot_df.sort_index(ascending=False)
         
-        # Plot Heatmap
-        fig, ax = plt.subplots(figsize=(8, 6))
+        # Order X-axis to keep GNTS together and baselines together
+        strategy_order = ["LocalGNTS_14", "GlobalGNTS_14", "Beta_Binomial_14", "Proportional", "Uniform", "Random"]
+        valid_cols = [c for c in strategy_order if c in pivot_df.columns]
+        other_cols = [c for c in pivot_df.columns if c not in valid_cols]
+        pivot_df = pivot_df[valid_cols + other_cols]
+        
+        # Plot Heatmap (Slightly wider to fit the method names)
+        fig, ax = plt.subplots(figsize=(10, 6))
         sns.heatmap(pivot_df, annot=True, fmt=".3f", cmap="viridis", ax=ax, 
                     cbar_kws={'label': 'Mean Detection Ratio'})
         
-        ax.set_xlabel("Network Size (Number of Nodes)")
+        ax.set_xlabel("Allocation Strategy")
         ax.set_ylabel("Target Peak Infection Day")
+        ax.set_title("Detection Ratio: GNTS vs Baselines across Epidemic Speeds")
         
-        clean_model = model_name.replace('_', '-')
-        ax.set_title(f"Detection Ratio Heatmap: {clean_model}")
+        # Clean up x-axis labels (replace underscores, rotate)
+        labels = [item.get_text().replace('_', '-') for item in ax.get_xticklabels()]
+        ax.set_xticklabels(labels, rotation=45, ha='right')
         
-        heatmap_path = os.path.join(out_dir, f"heatmap_{clean_model.lower()}.svg")
+        heatmap_path = os.path.join(out_dir, "heatmap_methods_vs_peak.svg")
         fig.savefig(heatmap_path, format="svg", bbox_inches="tight")
         plt.close(fig)
         print(f"  Saved Heatmap: {heatmap_path}")
