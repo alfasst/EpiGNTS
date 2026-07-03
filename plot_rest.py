@@ -131,7 +131,8 @@ def process_peak_shift_experiments(csv_dir, out_dir):
         return
 
     scenarios = ["Peak_25", "Peak_40", "Peak_60", "Peak_80", "Peak_100"]
-    strategies = ["LocalGNTS_14", "GlobalGNTS_14", "Beta_Binomial_14", "Proportional", "Uniform", "Random"]
+    strategies = ["LocalGNTS_14", "GlobalGNTS_14", "Beta_Binomial_14",
+                  "Proportional","Uniform", "Random"]
     networks = ["SBM-5k-Med"] # Locked to the single network used in the updated experiment
 
     print("\nProcessing Peak Shift Data (CSVs and Line Plots)...")
